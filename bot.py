@@ -1,6 +1,7 @@
-import os, io, time, math, json, threading, sqlite3, traceback
+import os, io, time, math, json, threading, sqlite3, traceback, pickle
 from datetime import datetime, timezone
 from typing import Dict, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import numpy as np
@@ -12,12 +13,21 @@ from flask import Flask, jsonify
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-VERSION = "FULL AI QUANT v10 RAILWAY FORCED"
+VERSION = "FULL AI QUANT v11 RAILWAY PRO"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 ALLOW_SYN = os.getenv("ALLOW_SYNTHETIC_FALLBACK", "true").lower() in ("1","true","yes","on")
 PROXY_URL = os.getenv("MARKET_DATA_PROXY_URL", "").strip()
 DB_PATH = os.getenv("DB_PATH", "signals.db")
 START_TS = time.time()
+CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "55"))
+CANDLE_CACHE = {}
+REDIS_CLIENT = None
+try:
+    import redis
+    if os.getenv("REDIS_URL"):
+        REDIS_CLIENT = redis.from_url(os.getenv("REDIS_URL"), socket_timeout=3, socket_connect_timeout=3)
+except Exception:
+    REDIS_CLIENT = None
 
 SYMBOLS = {"BTC":"BTCUSDT", "ETH":"ETHUSDT", "SOL":"SOLUSDT", "XRP":"XRPUSDT"}
 COINGECKO_IDS = {"BTCUSDT":"bitcoin", "ETHUSDT":"ethereum", "SOLUSDT":"solana", "XRPUSDT":"ripple"}
@@ -163,16 +173,54 @@ def synthetic(symbol, interval, limit):
     return pd.DataFrame({"ts":ts,"open":open_,"high":high,"low":low,"close":close,"volume":volume}), "DEMO: OFFLINE_SYNTHETIC_NOT_REAL_MARKET_DATA"
 
 def fetch_candles(symbol, interval="15m", limit=500):
+    key=(symbol, interval, limit)
+    rkey=f"candles:{symbol}:{interval}:{limit}"
+    now=time.time()
+    if REDIS_CLIENT is not None:
+        try:
+            raw=REDIS_CLIENT.get(rkey)
+            if raw:
+                df, src = pickle.loads(raw)
+                return df.copy(), src + " / REDIS_CACHE"
+        except Exception as e:
+            print("REDIS_CACHE_FAIL", repr(e), flush=True)
+    cached=CANDLE_CACHE.get(key)
+    if cached and now-cached[0] < CACHE_TTL:
+        df, src = cached[1].copy(), cached[2] + " / MEMORY_CACHE"
+        return df, src
     providers = [fetch_proxy, fetch_binance, fetch_bybit, fetch_okx, fetch_coinbase, fetch_coingecko]
     errors=[]
     for fn in providers:
         try:
-            return fn(symbol, interval, limit)
+            df, src = fn(symbol, interval, limit)
+            CANDLE_CACHE[key]=(now, df.copy(), src)
+            if REDIS_CLIENT is not None:
+                try: REDIS_CLIENT.setex(rkey, CACHE_TTL, pickle.dumps((df.copy(), src)))
+                except Exception as e: print("REDIS_SET_FAIL", repr(e), flush=True)
+            return df, src
         except Exception as e:
             errors.append(f"{fn.__name__}: {e}")
             print("MARKET_FAIL", fn.__name__, symbol, interval, repr(e), flush=True)
     print("ALL_MARKET_PROVIDERS_FAILED", " | ".join(errors), flush=True)
-    return synthetic(symbol, interval, limit)
+    df, src = synthetic(symbol, interval, limit)
+    CANDLE_CACHE[key]=(now, df.copy(), src)
+    return df, src
+
+def fetch_multi_tf(symbol):
+    # Parallel TF engine: faster on Railway than sequential market calls.
+    jobs=[("15m",500),("1h",500),("4h",400),("1d",250)]
+    data={}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs={ex.submit(fetch_candles, symbol, tf, lim): tf for tf,lim in jobs}
+        for fut in as_completed(futs, timeout=45):
+            tf=futs[fut]
+            try:
+                data[tf]=fut.result()
+            except Exception as e:
+                print("TF_FAIL", symbol, tf, repr(e), flush=True)
+    if not data:
+        data["15m"] = synthetic(symbol, "15m", 500)
+    return data
 
 def indicators(df):
     d=df.copy()
@@ -203,7 +251,67 @@ def volume_profile(d):
     vah=np.percentile(recent.close,70); val=np.percentile(recent.close,30)
     return poc, vah, val
 
-def score(df, sources):
+def session_ai():
+    h=datetime.utcnow().hour
+    if 0 <= h < 7: return "ASIA", "lower liquidity / sweep risk"
+    if 7 <= h < 13: return "LONDON", "breakout/sweep window"
+    if 13 <= h < 21: return "NEW YORK", "highest liquidity / continuation or reversal"
+    return "POST-NY", "lower liquidity / chop risk"
+
+def liquidity_map_v2(d):
+    r=d.tail(160).copy()
+    hi=r.high.rolling(3, center=True).max()
+    lo=r.low.rolling(3, center=True).min()
+    swing_highs=r.high[(r.high==hi)].tail(8).values
+    swing_lows=r.low[(r.low==lo)].tail(8).values
+    eq_high=float(np.median(swing_highs)) if len(swing_highs) else float(r.high.max())
+    eq_low=float(np.median(swing_lows)) if len(swing_lows) else float(r.low.min())
+    last=float(r.close.iloc[-1])
+    up_dist=abs(eq_high-last)/(last+1e-9)*100
+    dn_dist=abs(last-eq_low)/(last+1e-9)*100
+    if up_dist < dn_dist:
+        magnet="upper liquidity / buy stops"; sweep_prob=max(25, min(85, 75-up_dist*20))
+    else:
+        magnet="lower liquidity / sell stops"; sweep_prob=max(25, min(85, 75-dn_dist*20))
+    fake_breakout = "HIGH" if min(up_dist,dn_dist)<0.35 and r.close.pct_change().tail(20).std()*100>0.18 else "NORMAL"
+    return {"upper":eq_high,"lower":eq_low,"magnet":magnet,"sweep_prob":round(sweep_prob,1),"fake_breakout":fake_breakout}
+
+def htf_alignment(tf_results):
+    votes=[]
+    weights={"15m":0.18,"1h":0.37,"4h":0.30,"1d":0.15}
+    srcs=[]
+    for tf,(df,src) in tf_results.items():
+        d=indicators(df)
+        bias=1 if d.ema21.iloc[-1]>d.ema55.iloc[-1] else -1
+        mac=1 if d.macd.iloc[-1]>d.macds.iloc[-1] else -1
+        score=(bias+mac)/2
+        votes.append(score*weights.get(tf,0.1)); srcs.append(f"{tf}:{src}")
+    net=sum(votes); align=round(50+abs(net)*50,1)
+    direction="LONG" if net>0 else "SHORT" if net<0 else "MIXED"
+    conflict="LOW" if align>=75 else "MEDIUM" if align>=60 else "HIGH"
+    return {"score":align,"direction":direction,"conflict":conflict,"sources":"; ".join(srcs)}
+
+def journal_adaptive_bias(symbol):
+    try:
+        init_db(); con=sqlite3.connect(DB_PATH)
+        rows=con.execute("SELECT signal, confidence FROM signals WHERE symbol=? ORDER BY id DESC LIMIT 30", (symbol,)).fetchall(); con.close()
+        if len(rows)<5: return 0, "not enough memory"
+        long_conf=sum(c for sig,c in rows if sig=='LONG'); short_conf=sum(c for sig,c in rows if sig=='SHORT')
+        bias=max(-3,min(3,(long_conf-short_conf)/max(1,(long_conf+short_conf))*5))
+        return bias, f"journal adaptive bias {bias:+.1f}"
+    except Exception:
+        return 0, "journal unavailable"
+
+def grade_signal(conf, rr, align, demo):
+    if demo: return "DEMO"
+    score=conf + min(12, rr*3) + (align-50)*0.22
+    if score>=94: return "A+"
+    if score>=84: return "A"
+    if score>=74: return "B"
+    if score>=63: return "C"
+    return "AVOID"
+
+def score(df, sources, symbol=""):
     d=indicators(df); last=d.iloc[-1]; price=float(last.close)
     lp=50.0
     reasons=[]
@@ -220,6 +328,12 @@ def score(df, sources):
     poc,vah,val=volume_profile(d)
     if price>poc: lp+=4; reasons.append("Above POC")
     else: lp-=4; reasons.append("Below POC")
+    liq=liquidity_map_v2(d)
+    if liq["magnet"].startswith("upper"): lp+=3
+    else: lp-=3
+    reasons.append(f"Liquidity magnet: {liq['magnet']} / sweep {liq['sweep_prob']}%")
+    sess, sess_note = session_ai(); reasons.append(f"Session: {sess} - {sess_note}")
+    jb, jnote = journal_adaptive_bias(symbol); lp += jb; reasons.append(jnote)
     vol=d.close.pct_change().tail(80).std()*100
     regime = "TREND" if abs(d.ema21.iloc[-1]-d.ema55.iloc[-1]) / price > 0.006 else "RANGE"
     if vol>0.45: regime += " / HIGH_VOL"
@@ -227,13 +341,17 @@ def score(df, sources):
     signal="LONG" if lp>=55 else "SHORT" if sp>=55 else "NEUTRAL"
     confidence=round(min(96, 45+abs(lp-50)*0.9 + min(20,wc/5)),1)
     atr=float(last.atr if not math.isnan(last.atr) else price*0.01)
-    if signal=="LONG": entry=price; sl=price-1.6*atr; tps=[price+1.2*atr, price+2.2*atr, price+3.5*atr]
-    elif signal=="SHORT": entry=price; sl=price+1.6*atr; tps=[price-1.2*atr, price-2.2*atr, price-3.5*atr]
-    else: entry=price; sl=price-1.2*atr; tps=[price+atr, price+2*atr, price+3*atr]
+    # Dynamic RR engine: wider targets in trend, safer targets in range/high volatility
+    trend_mult = 1.25 if regime.startswith("TREND") else 0.92
+    vol_mult = 0.82 if "HIGH_VOL" in regime else 1.0
+    m = trend_mult * vol_mult
+    if signal=="LONG": entry=price; sl=price-1.45*atr; tps=[price+1.15*atr*m, price+2.15*atr*m, price+3.65*atr*m]
+    elif signal=="SHORT": entry=price; sl=price+1.45*atr; tps=[price-1.15*atr*m, price-2.15*atr*m, price-3.65*atr*m]
+    else: entry=price; sl=price-1.2*atr; tps=[price+atr*m, price+2*atr*m, price+3*atr*m]
     rr=round(abs(tps[-1]-entry)/(abs(entry-sl)+1e-9),2)
     cont=round(max(lp,sp)*0.82 + confidence*0.18,1)
     return {"df":d,"price":price,"long":round(lp,1),"short":round(sp,1),"signal":signal,"confidence":confidence,"entry":entry,"sl":sl,"tps":tps,"rr":rr,"regime":regime,
-            "wave":wave,"poc":poc,"vah":vah,"val":val,"cont":cont,"reasons":reasons[:8],"source":sources}
+            "wave":wave,"poc":poc,"vah":vah,"val":val,"cont":cont,"reasons":reasons[:10],"source":sources,"liquidity":liq,"session":sess,"grade":""}
 
 def make_chart(res, symbol):
     d=res['df'].tail(140).reset_index(drop=True)
@@ -252,7 +370,7 @@ def make_chart(res, symbol):
     buf=io.BytesIO(); fig.tight_layout(); fig.savefig(buf, format='png'); plt.close(fig); buf.seek(0); return buf
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"{VERSION}\nОдна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, journal.", reply_markup=KEYBOARD)
+    await update.message.reply_text(f"{VERSION}\nОдна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, HTF alignment, Session AI, Liquidity Map v2, Dynamic RR, journal/cache.", reply_markup=KEYBOARD)
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s=int(time.time()-START_TS); await update.message.reply_text(f"Работает: {s//3600}h {(s%3600)//60}m {s%60}s\n{VERSION}")
@@ -264,9 +382,19 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, coin: str)
     symbol=SYMBOLS[coin]
     await update.message.reply_text(f"Считаю {VERSION} {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
     try:
-        # Try 15m primary, but if some tf fail, primary still works due fallback
-        df, src = fetch_candles(symbol, "15m", 500)
-        res=score(df, src)
+        tfdata = fetch_multi_tf(symbol)
+        htf = htf_alignment(tfdata)
+        df, src = tfdata.get("1h") or tfdata.get("15m") or next(iter(tfdata.values()))
+        res=score(df, src, symbol)
+        # HTF Alignment Engine: adjusts probability and confidence when higher timeframes agree/conflict
+        if htf["direction"] == "LONG":
+            res["long"] = round(min(95, res["long"] + (htf["score"]-50)*0.08),1); res["short"] = round(100-res["long"],1)
+        elif htf["direction"] == "SHORT":
+            res["short"] = round(min(95, res["short"] + (htf["score"]-50)*0.08),1); res["long"] = round(100-res["short"],1)
+        res["signal"] = "LONG" if res["long"]>=55 else "SHORT" if res["short"]>=55 else "NEUTRAL"
+        res["confidence"] = round(max(5, min(96, res["confidence"] + (htf["score"]-65)*0.10 - (8 if htf["conflict"]=="HIGH" else 0))),1)
+        res["htf"] = htf
+        res["grade"] = grade_signal(res["confidence"], res["rr"], htf["score"], res['source'].startswith('DEMO'))
         save_signal(symbol,res['signal'],res['long'],res['short'],res['confidence'],res['source'],res['price'])
         demo = "⚠️ DEMO / НЕ РЫНОЧНЫЕ ДАННЫЕ" if res['source'].startswith('DEMO') else "✅ REAL MARKET DATA"
         msg=(f"{demo}\n"
@@ -275,9 +403,10 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, coin: str)
              f"Signal: {res['signal']}\n"
              f"LONG probability: {res['long']}%\nSHORT probability: {res['short']}%\n"
              f"Confidence: {res['confidence']}%\nContinuation: {res['cont']}%\n"
-             f"Regime: {res['regime']}\nElliott: {res['wave']}\n\n"
+             f"Regime: {res['regime']}\nSession AI: {res['session']}\nSignal Grade: {res['grade']}\nHTF Alignment: {res['htf']['score']}% / {res['htf']['direction']} / conflict {res['htf']['conflict']}\nElliott: {res['wave']}\n\n"
              f"Entry: {res['entry']:.6g}\nSL: {res['sl']:.6g}\nTP1: {res['tps'][0]:.6g}\nTP2: {res['tps'][1]:.6g}\nTP3: {res['tps'][2]:.6g}\nRR: 1:{res['rr']}\n\n"
-             f"VPVR POC: {res['poc']:.6g}\nVAH/VAL: {res['vah']:.6g} / {res['val']:.6g}\n\n"
+             f"VPVR POC: {res['poc']:.6g}\nVAH/VAL: {res['vah']:.6g} / {res['val']:.6g}\n"
+             f"Liquidity v2: upper {res['liquidity']['upper']:.6g} / lower {res['liquidity']['lower']:.6g} / sweep {res['liquidity']['sweep_prob']}% / fake breakout {res['liquidity']['fake_breakout']}\n\n"
              f"Factors:\n- " + "\n- ".join(res['reasons']))
         await update.message.reply_photo(make_chart(res,symbol), caption=msg[:1024])
         if len(msg)>1024: await update.message.reply_text(msg[1024:])
