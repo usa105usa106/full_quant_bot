@@ -131,35 +131,74 @@ def db_stats(limit=20):
     return {"total": total, "latest": rows, "by_symbol": by_symbol}
 
 
-def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
-    base = BINANCE_FUTURES if futures else BINANCE_SPOT
-    path = "/fapi/v1/klines" if futures else "/api/v3/klines"
-    raw = http_get(f"{base}{path}", {"symbol": symbol, "interval": interval, "limit": limit})
+def _parse_klines(raw) -> pd.DataFrame:
     cols = ["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tbav", "tqav", "ignore"]
     df = pd.DataFrame(raw, columns=cols)
     for c in ["open", "high", "low", "close", "volume", "qav", "tbav", "tqav"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    # В Binance spot и futures есть taker buy base volume, используем его для CVD approximation.
     df["taker_buy_vol"] = pd.to_numeric(df["tbav"], errors="coerce")
     return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna()
 
 
+def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
+    """Fetch candles with Railway/Binance 451 protection.
+
+    Binance often blocks Futures API from cloud IPs with HTTP 451.
+    The bot first tries Futures candles, then automatically falls back to Spot candles
+    so Railway deploys keep working.
+    """
+    if futures:
+        try:
+            raw = http_get(f"{BINANCE_FUTURES}/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+            df = _parse_klines(raw)
+            df.attrs["market_source"] = "binance_futures"
+            return df
+        except Exception as e:
+            print(f"[WARN] Futures klines failed for {symbol} {interval}: {e}. Falling back to spot.")
+
+    raw = http_get(f"{BINANCE_SPOT}/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+    df = _parse_klines(raw)
+    df.attrs["market_source"] = "binance_spot_fallback" if futures else "binance_spot"
+    return df
+
+
 def fetch_futures_context(symbol: str) -> dict:
-    ctx = {"funding": None, "open_interest": None, "depth_imbalance": None, "glassnode": "not_configured", "coinglass": "not_configured"}
+    ctx = {
+        "funding": None, "open_interest": None, "depth_imbalance": None,
+        "market_source": "binance_futures",
+        "glassnode": "not_configured", "coinglass": "not_configured"
+    }
     try:
         prem = http_get(f"{BINANCE_FUTURES}/fapi/v1/premiumIndex", {"symbol": symbol})
         ctx["funding"] = float(prem.get("lastFundingRate", 0))
-    except Exception as e: ctx["funding_error"] = str(e)
+    except Exception as e:
+        ctx["funding_error"] = str(e)
+        ctx["market_source"] = "binance_spot_fallback"
     try:
         oi = http_get(f"{BINANCE_FUTURES}/fapi/v1/openInterest", {"symbol": symbol})
         ctx["open_interest"] = float(oi.get("openInterest", 0))
-    except Exception as e: ctx["oi_error"] = str(e)
+    except Exception as e:
+        ctx["oi_error"] = str(e)
+        ctx["market_source"] = "binance_spot_fallback"
+    # Orderbook imbalance: first Futures, then Spot fallback.
     try:
         depth = http_get(f"{BINANCE_FUTURES}/fapi/v1/depth", {"symbol": symbol, "limit": 100})
+    except Exception as e:
+        ctx["futures_depth_error"] = str(e)
+        ctx["market_source"] = "binance_spot_fallback"
+        try:
+            depth = http_get(f"{BINANCE_SPOT}/api/v3/depth", {"symbol": symbol, "limit": 100})
+        except Exception as e2:
+            ctx["depth_error"] = str(e2)
+            depth = {"bids": [], "asks": []}
+    try:
         bid_qty = sum(float(x[1]) for x in depth.get("bids", [])[:50])
         ask_qty = sum(float(x[1]) for x in depth.get("asks", [])[:50])
         ctx["depth_imbalance"] = (bid_qty - ask_qty) / max(bid_qty + ask_qty, 1e-9)
-    except Exception as e: ctx["depth_error"] = str(e)
+    except Exception as e:
+        ctx["depth_calc_error"] = str(e)
     if os.getenv("GLASSNODE_API_KEY"): ctx["glassnode"] = "api_key_present_optional_hook"
     if os.getenv("COINGLASS_API_KEY"): ctx["coinglass"] = "api_key_present_optional_hook"
     return ctx
@@ -449,7 +488,7 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
     reasons.append(f"Monte Carlo: survival {mc['survival']}% · risk of stop {mc['risk_of_stop']}%")
 
     text = (
-        f"🏦 FULL AI QUANT SYSTEM v5\n📊 {symbol} · Binance Futures · TF {PRIMARY_TF}\nЦена: {price:,.2f}\nРежим рынка: {reg['regime']}\n\n"
+        f"🏦 FULL AI QUANT SYSTEM v6\n📊 {symbol} · {ctx.get('market_source', 'binance')} · TF {PRIMARY_TF}\nЦена: {price:,.2f}\nРежим рынка: {reg['regime']}\n\n"
         f"Решение: {side}\nLONG probability: {long_probability}%\nSHORT probability: {short_probability}%\nConfidence: {confidence}%\nContinuation probability: {continuation_probability}%\nSetup Quality: {quality}\nRisk Score: {risk_score}/100\n{decision}\nAI/ML score: {score:+.1f}\n\n"
         f"Вход: {price:,.2f}\nStop: {stop:,.2f}\nTake 1: {take1:,.2f}\nTake 2: {take2:,.2f}\nTake 3: {take3:,.2f}\nRR к TP2: {rr:.2f}\nExpected move: {expected_move_pct:.2f}%\n\n"
         f"Elliott: {wave['label']} · {wave['confidence']}% · invalidation {wave['invalidation']:,.2f}\n"
@@ -492,7 +531,7 @@ def menu():
     return InlineKeyboardMarkup([[InlineKeyboardButton("BTC", callback_data="btc"), InlineKeyboardButton("ETH", callback_data="eth")], [InlineKeyboardButton("SOL", callback_data="sol"), InlineKeyboardButton("XRP", callback_data="xrp")], [InlineKeyboardButton("STATS", callback_data="stats"), InlineKeyboardButton("STATUS", callback_data="status")]])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("FULL AI QUANT v5 готов. Одна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, walk-forward, journal.", reply_markup=menu())
+    await update.message.reply_text("FULL AI QUANT v6 готов. Одна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, walk-forward, journal.", reply_markup=menu())
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t0=time.perf_counter(); await update.message.reply_text("pong"); await update.message.reply_text(f"Время отклика: {(time.perf_counter()-t0)*1000:.0f} ms")
@@ -513,7 +552,7 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     target = update.callback_query.message if update.callback_query else update.message; symbol = SYMBOLS[key]
-    await target.reply_text(f"Считаю FULL AI QUANT v5 {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
+    await target.reply_text(f"Считаю FULL AI QUANT v6 {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
     try:
         signal, data = await asyncio.to_thread(analyze, symbol); chart = await asyncio.to_thread(make_chart, symbol, data, signal)
         await target.reply_photo(photo=chart, caption=signal.text[:1024])

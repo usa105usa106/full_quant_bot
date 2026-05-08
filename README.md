@@ -1,4 +1,4 @@
-# Crypto TA Telegram Bot v5 — Full AI Quant System
+# Crypto TA Telegram Bot v6 — Full AI Quant System
 
 Railway-ready Telegram bot. Одна кнопка монеты запускает полный AI/quant-анализ и отправляет текст + график.
 
@@ -60,3 +60,19 @@ AUTO_SIGNAL_INTERVAL_MIN=15
 
 ## Важно
 Это аналитический бот. Вероятности — модельный confidence, не гарантия прибыли и не финансовый совет.
+
+
+## v6 Railway/Binance 451 fix
+
+Добавлен автоматический fallback:
+
+- сначала бот пробует Binance Futures API: `https://fapi.binance.com/fapi/v1/klines`;
+- если Railway получает `451 Client Error`, бот сам переключается на Binance Spot API: `https://api.binance.com/api/v3/klines`;
+- orderbook depth тоже пробует Futures, потом Spot;
+- funding/open interest при блокировке будут `n/a`, но основной AI-анализ, график, CVD approximation, VPVR, Elliott, heatmap, scoring, Monte Carlo и journal продолжают работать.
+
+Ничего дополнительно в Railway менять не нужно. Переменная токена та же:
+
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+```
