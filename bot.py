@@ -303,12 +303,12 @@ def fetch_cryptocompare(symbol: str, interval: str, limit: int) -> pd.DataFrame:
 def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
     """Railway-safe candle fetcher.
 
-    v8 uses layered networking:
+    v9 uses layered networking:
     1) CCXT exchanges: Binance Futures/Spot, Bybit, OKX, Kraken, Coinbase
     2) Direct REST fallbacks: Binance, Bybit, OKX
     3) CryptoCompare public market data
 
-    This avoids the common Railway/Binance HTTP 451 problem and also handles SSL/timeouts better.
+    This avoids the common Railway/Binance HTTP 451 problem and also handles SSL/timeouts better. If every market source is blocked, v9 returns synthetic OFFLINE candles so the bot does not crash.
     """
     errors = []
     # First: CCXT. It handles many exchange quirks better than raw requests.
@@ -352,7 +352,99 @@ def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_L
         errors.append(f"CryptoCompare: {type(e).__name__}")
         print(f"[WARN] CryptoCompare failed for {symbol} {interval}: {e}")
 
-    raise RuntimeError("Не удалось получить свечи. Проверь Railway Logs. Источники: " + "; ".join(errors))
+    # Fourth: Yahoo Finance chart API. Usually works from Railway even when crypto exchanges block cloud IPs.
+    try:
+        return fetch_yahoo(symbol, interval, limit)
+    except Exception as e:
+        errors.append(f"Yahoo: {type(e).__name__}")
+        print(f"[WARN] Yahoo Finance failed for {symbol} {interval}: {e}")
+
+    # Last resort: do not crash the bot. This is clearly labeled in the report as OFFLINE, not real market data.
+    print(f"[ERROR] All market providers failed for {symbol} {interval}: {'; '.join(errors)}")
+    return generate_synthetic_ohlcv(symbol, interval, limit)
+
+
+
+def _yahoo_symbol(symbol: str) -> str:
+    base = symbol.replace("USDT", "")
+    return f"{base}-USD"
+
+
+def _yahoo_range_interval(interval: str, limit: int):
+    # Yahoo supports 15m/1h intervals for recent ranges and 1d for long ranges.
+    if interval == "15m":
+        return "15m", "5d"
+    if interval == "1h":
+        return "1h", "30d"
+    if interval == "4h":
+        # Yahoo has no 4h interval; fetch 1h and resample below.
+        return "1h", "60d"
+    return "1d", "400d"
+
+
+def fetch_yahoo(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Railway-friendly public fallback via Yahoo Finance chart API."""
+    ysym = _yahoo_symbol(symbol)
+    yinterval, yrange = _yahoo_range_interval(interval, limit)
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}"
+    data = http_get(url, {"interval": yinterval, "range": yrange, "includePrePost": "false"})
+    result = (data.get("chart", {}).get("result") or [None])[0]
+    if not result:
+        raise ValueError("Yahoo returned no chart result")
+    ts = result.get("timestamp") or []
+    q = (result.get("indicators", {}).get("quote") or [{}])[0]
+    if not ts or not q:
+        raise ValueError("Yahoo returned empty candles")
+    df = pd.DataFrame({
+        "time": pd.to_datetime(ts, unit="s", utc=True),
+        "open": q.get("open"),
+        "high": q.get("high"),
+        "low": q.get("low"),
+        "close": q.get("close"),
+        "volume": q.get("volume"),
+    })
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("time")
+    df["volume"] = df["volume"].fillna(0)
+    if interval == "4h":
+        df = df.set_index("time").resample("4h").agg({
+            "open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"
+        }).dropna().reset_index()
+    body = (df["close"] - df["open"]) / (df["high"] - df["low"]).replace(0, np.nan)
+    direction = (0.50 + body.clip(-1, 1).fillna(0) * 0.18).clip(0.32, 0.68)
+    df["taker_buy_vol"] = df["volume"] * direction
+    df["trades"] = 0
+    out = df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].tail(limit).reset_index(drop=True)
+    if len(out) < 60:
+        raise ValueError("Yahoo returned too few candles")
+    out.attrs["market_source"] = "yahoo_finance_fallback"
+    return out
+
+
+def generate_synthetic_ohlcv(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Last-resort no-crash mode. Not real market data; used only when every provider is blocked."""
+    import hashlib
+    seed = int(hashlib.sha256(f"{symbol}-{interval}".encode()).hexdigest()[:8], 16)
+    rng = np.random.default_rng(seed)
+    base_prices = {"BTCUSDT": 65000, "ETHUSDT": 3200, "SOLUSDT": 150, "XRPUSDT": 0.55}
+    start = float(base_prices.get(symbol, 100))
+    step = {"15m":"15min", "1h":"1h", "4h":"4h", "1d":"1d"}.get(interval, "15min")
+    times = pd.date_range(end=pd.Timestamp.utcnow().floor("min"), periods=limit, freq=step)
+    returns = rng.normal(0, 0.003 if interval != "1d" else 0.018, limit)
+    close = start * np.exp(np.cumsum(returns))
+    open_ = np.r_[close[0], close[:-1]]
+    spread = np.maximum(np.abs(close-open_), close * rng.uniform(0.001, 0.007, limit))
+    high = np.maximum(open_, close) + spread * rng.uniform(0.4, 1.2, limit)
+    low = np.minimum(open_, close) - spread * rng.uniform(0.4, 1.2, limit)
+    volume = rng.uniform(1000, 10000, limit) * (start / max(close.mean(), 1))
+    df = pd.DataFrame({"time":times, "open":open_, "high":high, "low":low, "close":close, "volume":volume})
+    body = (df["close"] - df["open"]) / (df["high"] - df["low"]).replace(0, np.nan)
+    direction = (0.50 + body.clip(-1, 1).fillna(0) * 0.18).clip(0.32, 0.68)
+    df["taker_buy_vol"] = df["volume"] * direction
+    df["trades"] = 0
+    df.attrs["market_source"] = "OFFLINE_SYNTHETIC_NOT_REAL_MARKET_DATA"
+    return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]]
 
 def fetch_futures_context(symbol: str) -> dict:
     ctx = {
@@ -643,7 +735,7 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
     if not frames:
         raise RuntimeError("Не удалось получить рыночные данные ни по одному таймфрейму: " + "; ".join(fetch_errors))
     df = frames[PRIMARY_TF] if PRIMARY_TF in frames else frames[TIMEFRAMES[0]]
-    ctx = fetch_futures_context(symbol); ms = market_structure(df); vp = volume_profile(df); heat = liquidity_heatmap(df); oflow = orderflow_advanced(df); wave = elliott_wave(df)
+    ctx = fetch_futures_context(symbol); ctx["candle_source"] = df.attrs.get("market_source", "unknown"); ms = market_structure(df); vp = volume_profile(df); heat = liquidity_heatmap(df); oflow = orderflow_advanced(df); wave = elliott_wave(df)
     highs, lows = ms["highs"], ms["lows"]; res_line, sup_line = fit_line(highs[-5:], len(df)), fit_line(lows[-5:], len(df)); hi, lo, fibs = fib_levels(df)
     last, prev = df.iloc[-1], df.iloc[-2]; price = float(last.close); atr_v = max(float(last.atr) if pd.notna(last.atr) else price*.01, price*.003)
     mtf = {tf: timeframe_score(frames[tf].dropna()) for tf in frames if len(frames[tf].dropna()) > 220}; reg = regime_ai(df, mtf); prob_up, features = ai_prediction_score(df.dropna(), list(mtf.values()))
@@ -699,10 +791,13 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
     reasons.append(f"Backtester: winrate {winrate*100:.1f}% на {trades} тест-сделках")
     reasons.append(f"Walk-forward: winrate {wf['winrate']*100:.1f}% · stability {wf['stability']}%")
     reasons.append(f"Monte Carlo: survival {mc['survival']}% · risk of stop {mc['risk_of_stop']}%")
+    source_note = ""
+    if str(ctx.get("candle_source", "")).startswith("OFFLINE_SYNTHETIC"):
+        source_note = "\n⚠️ MARKET DATA OFFLINE: все внешние источники заблокированы/недоступны. Это тестовый режим, НЕ реальные рыночные данные.\n"
 
     text = (
-        f"🏦 FULL AI QUANT SYSTEM v7\n📊 {symbol} · {ctx.get('market_source', 'binance')} · TF {PRIMARY_TF}\nЦена: {price:,.2f}\nРежим рынка: {reg['regime']}\n\n"
-        f"Решение: {side}\nLONG probability: {long_probability}%\nSHORT probability: {short_probability}%\nConfidence: {confidence}%\nContinuation probability: {continuation_probability}%\nSetup Quality: {quality}\nRisk Score: {risk_score}/100\n{decision}\nAI/ML score: {score:+.1f}\n\n"
+        f"🏦 FULL AI QUANT SYSTEM v9\n📊 {symbol} · candles: {ctx.get('candle_source', 'unknown')} · TF {PRIMARY_TF}\nЦена: {price:,.2f}\nРежим рынка: {reg['regime']}\n\n"
+        f"{source_note}Решение: {side}\nLONG probability: {long_probability}%\nSHORT probability: {short_probability}%\nConfidence: {confidence}%\nContinuation probability: {continuation_probability}%\nSetup Quality: {quality}\nRisk Score: {risk_score}/100\n{decision}\nAI/ML score: {score:+.1f}\n\n"
         f"Вход: {price:,.2f}\nStop: {stop:,.2f}\nTake 1: {take1:,.2f}\nTake 2: {take2:,.2f}\nTake 3: {take3:,.2f}\nRR к TP2: {rr:.2f}\nExpected move: {expected_move_pct:.2f}%\n\n"
         f"Elliott: {wave['label']} · {wave['confidence']}% · invalidation {wave['invalidation']:,.2f}\n"
         f"VPVR POC/VAH/VAL: {vp['poc']:,.2f} / {vp['vah']:,.2f} / {vp['val']:,.2f}\nHeatmap magnets: up {heat['magnet_up']:,.2f}, down {heat['magnet_down']:,.2f}\nOrderflow: {oflow['dominance']} · delta {oflow['delta_strength']:+.2%}\nOpen interest: {ctx.get('open_interest') or 'n/a'}\n\n"
@@ -744,7 +839,7 @@ def menu():
     return InlineKeyboardMarkup([[InlineKeyboardButton("BTC", callback_data="btc"), InlineKeyboardButton("ETH", callback_data="eth")], [InlineKeyboardButton("SOL", callback_data="sol"), InlineKeyboardButton("XRP", callback_data="xrp")], [InlineKeyboardButton("STATS", callback_data="stats"), InlineKeyboardButton("STATUS", callback_data="status")]])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("FULL AI QUANT v7 готов. Одна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, walk-forward, journal.", reply_markup=menu())
+    await update.message.reply_text("FULL AI QUANT v9 готов. Одна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, walk-forward, journal.", reply_markup=menu())
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t0=time.perf_counter(); await update.message.reply_text("pong"); await update.message.reply_text(f"Время отклика: {(time.perf_counter()-t0)*1000:.0f} ms")
@@ -765,14 +860,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     target = update.callback_query.message if update.callback_query else update.message; symbol = SYMBOLS[key]
-    await target.reply_text(f"Считаю FULL AI QUANT v7 {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
+    await target.reply_text(f"Считаю FULL AI QUANT v9 {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
     try:
         signal, data = await asyncio.to_thread(analyze, symbol); chart = await asyncio.to_thread(make_chart, symbol, data, signal)
         await target.reply_photo(photo=chart, caption=signal.text[:1024])
         if len(signal.text) > 1024: await target.reply_text(signal.text[1024:])
     except Exception as e:
         print(f"[ERROR] analysis failed: {e}")
-        await target.reply_text("Ошибка анализа: не удалось получить рыночные данные. В v7 включён fallback Binance → Bybit → OKX; попробуй ещё раз через 1 минуту или проверь логи Railway.")
+        await target.reply_text("Ошибка анализа: не удалось получить рыночные данные. В v9 включён no-crash fallback: CCXT → REST → Yahoo Finance → synthetic offline candles. Проверь Railway Logs, если видишь OFFLINE.")
 
 async def btc(update: Update, context: ContextTypes.DEFAULT_TYPE): await run_analysis(update, context, "btc")
 async def eth(update: Update, context: ContextTypes.DEFAULT_TYPE): await run_analysis(update, context, "eth")

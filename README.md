@@ -1,19 +1,16 @@
-# Crypto TA Telegram Bot v7 Railway Safe
+# Crypto TA Telegram Bot v9 Railway No-Crash
 
-Исправление v7: Binance может отдавать HTTP 451 на Railway/cloud IP.
-Теперь бот использует цепочку источников данных:
+Исправление v9:
+- Меню one-click: BTC/ETH/SOL/XRP.
+- CCXT + REST fallback.
+- Дополнительный fallback через Yahoo Finance.
+- Last-resort OFFLINE synthetic candles, чтобы бот не падал, если Railway/регион блокирует все рыночные API.
+- В отчёте явно показывает источник свечей: `candles: ...`.
+- Если видишь `OFFLINE_SYNTHETIC_NOT_REAL_MARKET_DATA`, значит внешние рыночные данные недоступны из Railway; бот работает в тестовом режиме, не для реальных сигналов.
 
-1. Binance Futures
-2. Binance Spot
-3. Bybit Spot fallback
-4. OKX Spot fallback
-
-Переменная Railway остаётся:
-
+Railway variable:
 ```env
-TELEGRAM_BOT_TOKEN=your_token
+TELEGRAM_BOT_TOKEN=your_bot_token
 ```
 
-Команды/кнопки: BTC, ETH, SOL, XRP, /stats, /status.
-
-Если Binance заблокирован полностью, анализ продолжит работать через Bybit/OKX. Futures-only данные вроде funding/OI будут помечены как недоступные, но AI scoring, Elliott, VPVR, CVD approximation, heatmap, Smart Money, Monte Carlo, walk-forward и график останутся рабочими.
+Start command берётся из Procfile.
