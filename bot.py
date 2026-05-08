@@ -12,6 +12,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import requests
+try:
+    import ccxt
+except Exception:
+    ccxt = None
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -62,10 +66,24 @@ class Signal:
     walk_forward_winrate: float
 
 
-def http_get(url: str, params: dict | None = None):
-    r = requests.get(url, params=params or {}, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+    "Accept": "application/json,text/plain,*/*",
+    "Connection": "keep-alive",
+})
+
+def http_get(url: str, params: dict | None = None, retries: int = 2):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            r = SESSION.get(url, params=params or {}, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_error = e
+            time.sleep(0.35 * (attempt + 1))
+    raise last_error
 
 
 def init_db():
@@ -187,43 +205,154 @@ def _parse_okx_klines(payload: dict) -> pd.DataFrame:
     return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna().sort_values("time").reset_index(drop=True)
 
 
-def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
-    """Fetch candles with multi-exchange fallback for Railway.
 
-    Some Railway/cloud IPs receive HTTP 451 even from Binance Spot/Futures.
-    Order:
-    1) Binance Futures
-    2) Binance Spot
-    3) Bybit Spot public candles
-    4) OKX Spot public candles
+def _symbol_to_ccxt(symbol: str) -> str:
+    base = symbol.replace("USDT", "")
+    return f"{base}/USDT"
+
+
+def _parse_ccxt_ohlcv(rows, source: str) -> pd.DataFrame:
+    if not rows:
+        raise ValueError(f"{source} returned empty candles")
+    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms", utc=True)
+    # Most public OHLCV endpoints do not expose true taker-buy volume.
+    # Approximation keeps CVD module alive but labels source as fallback.
+    body = (df["close"] - df["open"]) / (df["high"] - df["low"]).replace(0, np.nan)
+    direction = (0.50 + body.clip(-1, 1).fillna(0) * 0.18).clip(0.32, 0.68)
+    df["taker_buy_vol"] = df["volume"] * direction
+    df["trades"] = 0
+    out = df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna().sort_values("time").reset_index(drop=True)
+    out.attrs["market_source"] = source
+    return out
+
+
+def fetch_klines_ccxt(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    if ccxt is None:
+        raise RuntimeError("ccxt is not installed")
+    ccxt_symbol = _symbol_to_ccxt(symbol)
+    # Public exchanges with decent Railway/cloud reliability. enableRateLimit is important on Railway.
+    exchange_specs = [
+        ("binanceusdm", {"options": {"defaultType": "future"}}),
+        ("binance", {"options": {"defaultType": "spot"}}),
+        ("bybit", {"options": {"defaultType": "spot"}}),
+        ("okx", {"options": {"defaultType": "spot"}}),
+        ("kraken", {}),
+        ("coinbase", {}),
+    ]
+    errors = []
+    for ex_id, extra in exchange_specs:
+        try:
+            klass = getattr(ccxt, ex_id)
+            ex = klass({
+                "enableRateLimit": True,
+                "timeout": TIMEOUT * 1000,
+                "headers": {"User-Agent": SESSION.headers["User-Agent"]},
+                **extra,
+            })
+            # Avoid full market loading when possible; if symbol check fails, try anyway.
+            symbol_to_use = ccxt_symbol
+            if ex_id == "coinbase" and symbol.startswith("XRP"):
+                symbol_to_use = "XRP/USD"
+            elif ex_id == "coinbase":
+                symbol_to_use = symbol.replace("USDT", "/USD")
+            rows = ex.fetch_ohlcv(symbol_to_use, timeframe=interval, limit=min(limit, 500))
+            df = _parse_ccxt_ohlcv(rows, f"ccxt_{ex_id}")
+            if len(df) >= 80:
+                return df
+            errors.append(f"{ex_id}: too_few_candles")
+        except Exception as e:
+            errors.append(f"{ex_id}: {type(e).__name__}")
+            print(f"[WARN] ccxt {ex_id} failed for {symbol} {interval}: {e}")
+    raise RuntimeError("CCXT providers failed: " + "; ".join(errors))
+
+
+def _cryptocompare_symbol(symbol: str) -> str:
+    return symbol.replace("USDT", "")
+
+
+def fetch_cryptocompare(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    fsym = _cryptocompare_symbol(symbol)
+    if interval == "15m":
+        endpoint = "histominute"; params = {"fsym": fsym, "tsym": "USDT", "aggregate": 15, "limit": min(limit, 2000)}
+    elif interval == "1h":
+        endpoint = "histohour"; params = {"fsym": fsym, "tsym": "USDT", "limit": min(limit, 2000)}
+    elif interval == "4h":
+        endpoint = "histohour"; params = {"fsym": fsym, "tsym": "USDT", "aggregate": 4, "limit": min(limit, 2000)}
+    else:
+        endpoint = "histoday"; params = {"fsym": fsym, "tsym": "USDT", "limit": min(limit, 2000)}
+    data = http_get(f"https://min-api.cryptocompare.com/data/v2/{endpoint}", params)
+    rows = data.get("Data", {}).get("Data", [])
+    if not rows:
+        raise ValueError("CryptoCompare returned empty candles")
+    df = pd.DataFrame(rows)
+    df = df.rename(columns={"time": "open_time", "volumefrom": "volume"})
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="s", utc=True)
+    body = (df["close"] - df["open"]) / (df["high"] - df["low"]).replace(0, np.nan)
+    direction = (0.50 + body.clip(-1, 1).fillna(0) * 0.18).clip(0.32, 0.68)
+    df["taker_buy_vol"] = df["volume"] * direction
+    df["trades"] = 0
+    out = df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna().sort_values("time").reset_index(drop=True)
+    out.attrs["market_source"] = "cryptocompare_fallback"
+    return out
+
+def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
+    """Railway-safe candle fetcher.
+
+    v8 uses layered networking:
+    1) CCXT exchanges: Binance Futures/Spot, Bybit, OKX, Kraken, Coinbase
+    2) Direct REST fallbacks: Binance, Bybit, OKX
+    3) CryptoCompare public market data
+
+    This avoids the common Railway/Binance HTTP 451 problem and also handles SSL/timeouts better.
     """
     errors = []
+    # First: CCXT. It handles many exchange quirks better than raw requests.
+    try:
+        return fetch_klines_ccxt(symbol, interval, limit)
+    except Exception as e:
+        errors.append(f"CCXT: {type(e).__name__}")
+        print(f"[WARN] CCXT layer failed for {symbol} {interval}: {e}")
+
+    # Second: raw REST fallbacks, kept for small installs where ccxt is unavailable.
     if futures:
         try:
             raw = http_get(f"{BINANCE_FUTURES}/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-            df = _parse_klines(raw); df.attrs["market_source"] = "binance_futures"; return df
+            df = _parse_klines(raw); df.attrs["market_source"] = "binance_futures_rest"; return df
         except Exception as e:
-            errors.append(f"Binance Futures: {type(e).__name__}")
-            print(f"[WARN] Binance Futures failed for {symbol} {interval}: {e}")
+            errors.append(f"Binance Futures REST: {type(e).__name__}")
+            print(f"[WARN] Binance Futures REST failed for {symbol} {interval}: {e}")
     try:
         raw = http_get(f"{BINANCE_SPOT}/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-        df = _parse_klines(raw); df.attrs["market_source"] = "binance_spot"; return df
+        df = _parse_klines(raw); df.attrs["market_source"] = "binance_spot_rest"; return df
     except Exception as e:
-        errors.append(f"Binance Spot: {type(e).__name__}")
-        print(f"[WARN] Binance Spot failed for {symbol} {interval}: {e}")
+        errors.append(f"Binance Spot REST: {type(e).__name__}")
+        print(f"[WARN] Binance Spot REST failed for {symbol} {interval}: {e}")
     try:
         raw = http_get(f"{BYBIT_API}/v5/market/kline", {"category": "spot", "symbol": symbol, "interval": _bybit_interval(interval), "limit": min(limit, 1000)})
-        df = _parse_bybit_klines(raw); df.attrs["market_source"] = "bybit_spot_fallback"; return df
+        df = _parse_bybit_klines(raw); df.attrs["market_source"] = "bybit_spot_rest"; return df
     except Exception as e:
-        errors.append(f"Bybit: {type(e).__name__}")
-        print(f"[WARN] Bybit failed for {symbol} {interval}: {e}")
+        errors.append(f"Bybit REST: {type(e).__name__}")
+        print(f"[WARN] Bybit REST failed for {symbol} {interval}: {e}")
     try:
         raw = http_get(f"{OKX_API}/api/v5/market/candles", {"instId": _okx_inst_id(symbol), "bar": _okx_bar(interval), "limit": min(limit, 300)})
-        df = _parse_okx_klines(raw); df.attrs["market_source"] = "okx_spot_fallback"; return df
+        df = _parse_okx_klines(raw); df.attrs["market_source"] = "okx_spot_rest"; return df
     except Exception as e:
-        errors.append(f"OKX: {type(e).__name__}")
-        print(f"[WARN] OKX failed for {symbol} {interval}: {e}")
-    raise RuntimeError("Не удалось получить свечи ни с одного источника: " + "; ".join(errors))
+        errors.append(f"OKX REST: {type(e).__name__}")
+        print(f"[WARN] OKX REST failed for {symbol} {interval}: {e}")
+
+    # Third: market-data aggregator fallback.
+    try:
+        return fetch_cryptocompare(symbol, interval, limit)
+    except Exception as e:
+        errors.append(f"CryptoCompare: {type(e).__name__}")
+        print(f"[WARN] CryptoCompare failed for {symbol} {interval}: {e}")
+
+    raise RuntimeError("Не удалось получить свечи. Проверь Railway Logs. Источники: " + "; ".join(errors))
 
 def fetch_futures_context(symbol: str) -> dict:
     ctx = {
@@ -503,7 +632,16 @@ def setup_quality(confidence, rr, wf_winrate, mc_survival):
 
 
 def analyze(symbol: str) -> tuple[Signal, dict]:
-    frames = {tf: add_indicators(fetch_klines(symbol, tf, DEFAULT_LIMIT, True)) for tf in TIMEFRAMES}
+    frames = {}
+    fetch_errors = []
+    for tf in TIMEFRAMES:
+        try:
+            frames[tf] = add_indicators(fetch_klines(symbol, tf, DEFAULT_LIMIT, True))
+        except Exception as e:
+            fetch_errors.append(f"{tf}: {type(e).__name__}")
+            print(f"[WARN] timeframe fetch failed {symbol} {tf}: {e}")
+    if not frames:
+        raise RuntimeError("Не удалось получить рыночные данные ни по одному таймфрейму: " + "; ".join(fetch_errors))
     df = frames[PRIMARY_TF] if PRIMARY_TF in frames else frames[TIMEFRAMES[0]]
     ctx = fetch_futures_context(symbol); ms = market_structure(df); vp = volume_profile(df); heat = liquidity_heatmap(df); oflow = orderflow_advanced(df); wave = elliott_wave(df)
     highs, lows = ms["highs"], ms["lows"]; res_line, sup_line = fit_line(highs[-5:], len(df)), fit_line(lows[-5:], len(df)); hi, lo, fibs = fib_levels(df)
