@@ -21,6 +21,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 START_TIME = time.time()
 BINANCE_SPOT = os.getenv("BINANCE_SPOT", "https://api.binance.com")
 BINANCE_FUTURES = os.getenv("BINANCE_FUTURES", "https://fapi.binance.com")
+BYBIT_API = os.getenv("BYBIT_API", "https://api.bybit.com")
+OKX_API = os.getenv("OKX_API", "https://www.okx.com")
 DEFAULT_LIMIT = int(os.getenv("DEFAULT_LIMIT", "500"))
 TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))
 PRIMARY_TF = os.getenv("PRIMARY_TF", "1h")
@@ -132,37 +134,96 @@ def db_stats(limit=20):
 
 
 def _parse_klines(raw) -> pd.DataFrame:
+    """Parse Binance kline payload."""
     cols = ["open_time", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tbav", "tqav", "ignore"]
     df = pd.DataFrame(raw, columns=cols)
     for c in ["open", "high", "low", "close", "volume", "qav", "tbav", "tqav"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df["time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    # В Binance spot и futures есть taker buy base volume, используем его для CVD approximation.
     df["taker_buy_vol"] = pd.to_numeric(df["tbav"], errors="coerce")
-    return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna()
+    return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna().sort_values("time").reset_index(drop=True)
+
+
+def _okx_inst_id(symbol: str) -> str:
+    base = symbol.replace("USDT", "")
+    return f"{base}-USDT"
+
+
+def _okx_bar(interval: str) -> str:
+    return {"15m": "15m", "1h": "1H", "4h": "4H", "1d": "1D"}.get(interval, interval)
+
+
+def _bybit_interval(interval: str) -> str:
+    return {"15m": "15", "1h": "60", "4h": "240", "1d": "D"}.get(interval, interval)
+
+
+def _parse_bybit_klines(payload: dict) -> pd.DataFrame:
+    rows = payload.get("result", {}).get("list", [])
+    if not rows:
+        raise ValueError("Bybit returned empty candles")
+    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "turnover"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms", utc=True)
+    # Bybit public candles don't include taker-buy volume in this endpoint.
+    # Approximate delta direction from candle body so CVD module remains usable.
+    direction = np.where(df["close"] >= df["open"], 0.58, 0.42)
+    df["taker_buy_vol"] = df["volume"] * direction
+    df["trades"] = 0
+    return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna().sort_values("time").reset_index(drop=True)
+
+
+def _parse_okx_klines(payload: dict) -> pd.DataFrame:
+    rows = payload.get("data", [])
+    if not rows:
+        raise ValueError("OKX returned empty candles")
+    df = pd.DataFrame(rows, columns=["open_time", "open", "high", "low", "close", "volume", "vol_ccy", "vol_quote", "confirm"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["time"] = pd.to_datetime(pd.to_numeric(df["open_time"], errors="coerce"), unit="ms", utc=True)
+    direction = np.where(df["close"] >= df["open"], 0.58, 0.42)
+    df["taker_buy_vol"] = df["volume"] * direction
+    df["trades"] = 0
+    return df[["time", "open", "high", "low", "close", "volume", "taker_buy_vol", "trades"]].dropna().sort_values("time").reset_index(drop=True)
 
 
 def fetch_klines(symbol: str, interval: str = PRIMARY_TF, limit: int = DEFAULT_LIMIT, futures: bool = True) -> pd.DataFrame:
-    """Fetch candles with Railway/Binance 451 protection.
+    """Fetch candles with multi-exchange fallback for Railway.
 
-    Binance often blocks Futures API from cloud IPs with HTTP 451.
-    The bot first tries Futures candles, then automatically falls back to Spot candles
-    so Railway deploys keep working.
+    Some Railway/cloud IPs receive HTTP 451 even from Binance Spot/Futures.
+    Order:
+    1) Binance Futures
+    2) Binance Spot
+    3) Bybit Spot public candles
+    4) OKX Spot public candles
     """
+    errors = []
     if futures:
         try:
             raw = http_get(f"{BINANCE_FUTURES}/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-            df = _parse_klines(raw)
-            df.attrs["market_source"] = "binance_futures"
-            return df
+            df = _parse_klines(raw); df.attrs["market_source"] = "binance_futures"; return df
         except Exception as e:
-            print(f"[WARN] Futures klines failed for {symbol} {interval}: {e}. Falling back to spot.")
-
-    raw = http_get(f"{BINANCE_SPOT}/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    df = _parse_klines(raw)
-    df.attrs["market_source"] = "binance_spot_fallback" if futures else "binance_spot"
-    return df
-
+            errors.append(f"Binance Futures: {type(e).__name__}")
+            print(f"[WARN] Binance Futures failed for {symbol} {interval}: {e}")
+    try:
+        raw = http_get(f"{BINANCE_SPOT}/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+        df = _parse_klines(raw); df.attrs["market_source"] = "binance_spot"; return df
+    except Exception as e:
+        errors.append(f"Binance Spot: {type(e).__name__}")
+        print(f"[WARN] Binance Spot failed for {symbol} {interval}: {e}")
+    try:
+        raw = http_get(f"{BYBIT_API}/v5/market/kline", {"category": "spot", "symbol": symbol, "interval": _bybit_interval(interval), "limit": min(limit, 1000)})
+        df = _parse_bybit_klines(raw); df.attrs["market_source"] = "bybit_spot_fallback"; return df
+    except Exception as e:
+        errors.append(f"Bybit: {type(e).__name__}")
+        print(f"[WARN] Bybit failed for {symbol} {interval}: {e}")
+    try:
+        raw = http_get(f"{OKX_API}/api/v5/market/candles", {"instId": _okx_inst_id(symbol), "bar": _okx_bar(interval), "limit": min(limit, 300)})
+        df = _parse_okx_klines(raw); df.attrs["market_source"] = "okx_spot_fallback"; return df
+    except Exception as e:
+        errors.append(f"OKX: {type(e).__name__}")
+        print(f"[WARN] OKX failed for {symbol} {interval}: {e}")
+    raise RuntimeError("Не удалось получить свечи ни с одного источника: " + "; ".join(errors))
 
 def fetch_futures_context(symbol: str) -> dict:
     ctx = {
@@ -191,8 +252,22 @@ def fetch_futures_context(symbol: str) -> dict:
         try:
             depth = http_get(f"{BINANCE_SPOT}/api/v3/depth", {"symbol": symbol, "limit": 100})
         except Exception as e2:
-            ctx["depth_error"] = str(e2)
-            depth = {"bids": [], "asks": []}
+            ctx["spot_depth_error"] = type(e2).__name__
+            try:
+                by = http_get(f"{BYBIT_API}/v5/market/orderbook", {"category": "spot", "symbol": symbol, "limit": 50})
+                r = by.get("result", {})
+                depth = {"bids": r.get("b", []), "asks": r.get("a", [])}
+                ctx["market_source"] = "bybit_spot_fallback"
+            except Exception as e3:
+                ctx["bybit_depth_error"] = type(e3).__name__
+                try:
+                    ok = http_get(f"{OKX_API}/api/v5/market/books", {"instId": _okx_inst_id(symbol), "sz": 50})
+                    r = (ok.get("data") or [{}])[0]
+                    depth = {"bids": r.get("bids", []), "asks": r.get("asks", [])}
+                    ctx["market_source"] = "okx_spot_fallback"
+                except Exception as e4:
+                    ctx["depth_error"] = type(e4).__name__
+                    depth = {"bids": [], "asks": []}
     try:
         bid_qty = sum(float(x[1]) for x in depth.get("bids", [])[:50])
         ask_qty = sum(float(x[1]) for x in depth.get("asks", [])[:50])
@@ -488,7 +563,7 @@ def analyze(symbol: str) -> tuple[Signal, dict]:
     reasons.append(f"Monte Carlo: survival {mc['survival']}% · risk of stop {mc['risk_of_stop']}%")
 
     text = (
-        f"🏦 FULL AI QUANT SYSTEM v6\n📊 {symbol} · {ctx.get('market_source', 'binance')} · TF {PRIMARY_TF}\nЦена: {price:,.2f}\nРежим рынка: {reg['regime']}\n\n"
+        f"🏦 FULL AI QUANT SYSTEM v7\n📊 {symbol} · {ctx.get('market_source', 'binance')} · TF {PRIMARY_TF}\nЦена: {price:,.2f}\nРежим рынка: {reg['regime']}\n\n"
         f"Решение: {side}\nLONG probability: {long_probability}%\nSHORT probability: {short_probability}%\nConfidence: {confidence}%\nContinuation probability: {continuation_probability}%\nSetup Quality: {quality}\nRisk Score: {risk_score}/100\n{decision}\nAI/ML score: {score:+.1f}\n\n"
         f"Вход: {price:,.2f}\nStop: {stop:,.2f}\nTake 1: {take1:,.2f}\nTake 2: {take2:,.2f}\nTake 3: {take3:,.2f}\nRR к TP2: {rr:.2f}\nExpected move: {expected_move_pct:.2f}%\n\n"
         f"Elliott: {wave['label']} · {wave['confidence']}% · invalidation {wave['invalidation']:,.2f}\n"
@@ -531,7 +606,7 @@ def menu():
     return InlineKeyboardMarkup([[InlineKeyboardButton("BTC", callback_data="btc"), InlineKeyboardButton("ETH", callback_data="eth")], [InlineKeyboardButton("SOL", callback_data="sol"), InlineKeyboardButton("XRP", callback_data="xrp")], [InlineKeyboardButton("STATS", callback_data="stats"), InlineKeyboardButton("STATUS", callback_data="status")]])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("FULL AI QUANT v6 готов. Одна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, walk-forward, journal.", reply_markup=menu())
+    await update.message.reply_text("FULL AI QUANT v7 готов. Одна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, walk-forward, journal.", reply_markup=menu())
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t0=time.perf_counter(); await update.message.reply_text("pong"); await update.message.reply_text(f"Время отклика: {(time.perf_counter()-t0)*1000:.0f} ms")
@@ -552,12 +627,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def run_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, key: str):
     target = update.callback_query.message if update.callback_query else update.message; symbol = SYMBOLS[key]
-    await target.reply_text(f"Считаю FULL AI QUANT v6 {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
+    await target.reply_text(f"Считаю FULL AI QUANT v7 {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
     try:
         signal, data = await asyncio.to_thread(analyze, symbol); chart = await asyncio.to_thread(make_chart, symbol, data, signal)
         await target.reply_photo(photo=chart, caption=signal.text[:1024])
         if len(signal.text) > 1024: await target.reply_text(signal.text[1024:])
-    except Exception as e: await target.reply_text(f"Ошибка анализа: {e}")
+    except Exception as e:
+        print(f"[ERROR] analysis failed: {e}")
+        await target.reply_text("Ошибка анализа: не удалось получить рыночные данные. В v7 включён fallback Binance → Bybit → OKX; попробуй ещё раз через 1 минуту или проверь логи Railway.")
 
 async def btc(update: Update, context: ContextTypes.DEFAULT_TYPE): await run_analysis(update, context, "btc")
 async def eth(update: Update, context: ContextTypes.DEFAULT_TYPE): await run_analysis(update, context, "eth")
