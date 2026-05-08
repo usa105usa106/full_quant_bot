@@ -1,31 +1,51 @@
-# FULL AI QUANT v11 RAILWAY PRO
+# Crypto TA Telegram Bot v12 Railway Pro
 
-Railway-ready Telegram bot for BTC/ETH/SOL/XRP one-click AI analysis.
+Railway-ready Telegram bot for one-click and free-text AI quant analysis.
 
-## Required Railway variable
-`TELEGRAM_BOT_TOKEN=your_botfather_token`
+## What is included
+- Buttons: BTC / ETH / SOL / XRP.
+- Any coin by text: `ton`, `pol`, `not`, `dogs`, `pepe`, `bnb`, etc.
+- Command: `/analyze ton` or `/analyze POLUSDT`.
+- Multi-timeframe analysis: 15m / 1h / 4h / 1d.
+- Elliott Wave approximation, CVD, VPVR, liquidity map v2, session AI, HTF alignment, dynamic RR.
+- Signal output: LONG %, SHORT %, confidence %, continuation %, Entry, SL, TP1/TP2/TP3, RR.
+- Chart output in Telegram.
+- Journal/statistics with SQLite.
+- Optional Redis cache via `REDIS_URL`.
+- Railway-safe market data fallbacks.
 
-## Optional variables
-- `ALLOW_SYNTHETIC_FALLBACK=true` — if all real data APIs are down, bot shows DEMO mode instead of crashing.
-- `REDIS_URL=...` — optional Railway Redis cache. If absent, bot uses in-memory TTL cache.
-- `CACHE_TTL_SECONDS=55` — candle cache TTL.
-- `MARKET_DATA_PROXY_URL=...` — optional custom proxy returning rows.
+## Market data sources
+The bot tries providers in order and shows the source in every report:
+- Custom proxy if `MARKET_DATA_PROXY_URL` is set
+- Binance Spot mirrors
+- Bybit Spot
+- OKX Spot
+- BingX Spot
+- MEXC Spot
+- Coinbase
+- CoinGecko
+- DEMO synthetic fallback only if all real sources fail
 
-## v11 changes
-- HTF Alignment Engine: 15m/1h/4h/1d weighted direction and conflict score.
-- Session AI: Asia/London/New York/Post-NY market behavior context.
-- Liquidity Map v2: upper/lower liquidity, sweep probability, fake breakout risk.
-- Signal Grades: A+, A, B, C, AVOID, DEMO.
-- Dynamic RR Engine: adaptive TP/SL by trend/range/high-volatility regime.
-- AI Trade Memory: journal-based adaptive bias from recent bot signals.
-- Parallel multi-timeframe loading for faster Railway execution.
-- Optional Redis cache + default in-memory cache to reduce API requests.
-- Keeps v10 Railway-safe market fallbacks: OKX, Bybit, Binance mirrors, Coinbase, CoinGecko, synthetic demo fallback.
+If the report says `✅ REAL MARKET DATA`, the candles are real.
+If it says `⚠️ DEMO / НЕ РЫНОЧНЫЕ ДАННЫЕ`, do not trade from that analysis.
 
-## Deploy
-1. Upload to GitHub.
-2. Connect repo to Railway.
-3. Add `TELEGRAM_BOT_TOKEN`.
-4. Deploy.
+## Railway variables
+Required:
+```env
+TELEGRAM_BOT_TOKEN=your_botfather_token
+```
 
-If report shows `✅ REAL MARKET DATA`, analysis is based on real candles. If it shows `⚠️ DEMO`, do not trade it.
+Optional:
+```env
+REDIS_URL=redis://...
+ALLOW_SYNTHETIC_FALLBACK=true
+CACHE_TTL_SECONDS=55
+MARKET_DATA_PROXY_URL=https://your-proxy.example/candles?symbol={symbol}&interval={interval}&limit={limit}
+```
+
+## Run locally
+```bash
+pip install -r requirements.txt
+export TELEGRAM_BOT_TOKEN=...
+python bot.py
+```

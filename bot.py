@@ -13,7 +13,7 @@ from flask import Flask, jsonify
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-VERSION = "FULL AI QUANT v11 RAILWAY PRO"
+VERSION = "FULL AI QUANT v12 ANY COIN + BINGX/MEXC"
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 ALLOW_SYN = os.getenv("ALLOW_SYNTHETIC_FALLBACK", "true").lower() in ("1","true","yes","on")
 PROXY_URL = os.getenv("MARKET_DATA_PROXY_URL", "").strip()
@@ -30,12 +30,46 @@ except Exception:
     REDIS_CLIENT = None
 
 SYMBOLS = {"BTC":"BTCUSDT", "ETH":"ETHUSDT", "SOL":"SOLUSDT", "XRP":"XRPUSDT"}
-COINGECKO_IDS = {"BTCUSDT":"bitcoin", "ETHUSDT":"ethereum", "SOLUSDT":"solana", "XRPUSDT":"ripple"}
+COINGECKO_IDS = {"BTCUSDT":"bitcoin", "ETHUSDT":"ethereum", "SOLUSDT":"solana", "XRPUSDT":"ripple", "TONUSDT":"the-open-network", "POLUSDT":"polygon-ecosystem-token"}
+QUOTE_ASSETS = ("USDT", "USDC", "USD")
 KEYBOARD = ReplyKeyboardMarkup([["BTC","ETH"],["SOL","XRP"],["STATS","STATUS"]], resize_keyboard=True)
+
+def normalize_coin(text: str) -> Tuple[Optional[str], Optional[str]]:
+    raw = (text or "").strip().upper().replace("/", " ").replace("-", "").replace("_", "")
+    if not raw:
+        return None, "empty"
+    parts = raw.split()
+    if len(parts) >= 2 and parts[0] in ("ANALYZE", "ANALYSE", "A", "SIGNAL"):
+        raw = parts[1]
+    elif len(parts) > 1:
+        return None, "too many words"
+    raw = raw.replace("$", "")
+    aliases = {"XBT":"BTC", "MATIC":"POL"}
+    raw = aliases.get(raw, raw)
+    if raw in SYMBOLS:
+        return raw, None
+    for q in QUOTE_ASSETS:
+        if raw.endswith(q) and len(raw) > len(q):
+            base = raw[:-len(q)]
+            return base, None
+    if 2 <= len(raw) <= 12 and raw.isalnum():
+        return raw, None
+    return None, "bad ticker"
+
+def symbol_from_coin(coin: str) -> str:
+    return SYMBOLS.get(coin.upper(), coin.upper() + "USDT")
+
+def okx_inst(symbol: str, quote="USDT") -> str:
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol.replace(quote, "")
+    return f"{base}-{quote}"
+
+def dash_symbol(symbol: str, quote="USDT") -> str:
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol.replace(quote, "")
+    return f"{base}-{quote}"
 
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 RailwayQuantBot/10.0 (+https://railway.app)",
+    "User-Agent": "Mozilla/5.0 RailwayQuantBot/12.0 (+https://railway.app)",
     "Accept": "application/json,text/plain,*/*",
     "Connection": "close",
 })
@@ -115,24 +149,65 @@ def fetch_bybit(symbol, interval, limit):
     return df_from_rows(rows, "REAL: BYBIT_SPOT")
 
 def fetch_okx(symbol, interval, limit):
-    smap={"BTCUSDT":"BTC-USDT","ETHUSDT":"ETH-USDT","SOLUSDT":"SOL-USDT","XRPUSDT":"XRP-USDT"}
     imap={"15m":"15m","1h":"1H","4h":"4H","1d":"1D"}
-    js = request_json("https://www.okx.com/api/v5/market/candles", {"instId":smap[symbol],"bar":imap.get(interval,"15m"),"limit":limit})
-    data = js.get("data", [])
-    rows = [[int(x[0]),x[1],x[2],x[3],x[4],x[5]] for x in data][::-1]
-    return df_from_rows(rows, "REAL: OKX_SPOT")
+    last_err = None
+    for quote in ("USDT", "USDC", "USD"):
+        try:
+            js = request_json("https://www.okx.com/api/v5/market/candles", {"instId":okx_inst(symbol, quote),"bar":imap.get(interval,"15m"),"limit":limit})
+            data = js.get("data", [])
+            rows = [[int(x[0]),x[1],x[2],x[3],x[4],x[5]] for x in data][::-1]
+            return df_from_rows(rows, f"REAL: OKX_SPOT {okx_inst(symbol, quote)}")
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(last_err or "okx failed")
+
+def fetch_bingx(symbol, interval, limit):
+    # BingX supports many small-cap USDT pairs that Binance/OKX may not return from Railway.
+    imap={"15m":"15m","1h":"1h","4h":"4h","1d":"1d"}
+    bsym=dash_symbol(symbol, "USDT")
+    js = request_json("https://open-api.bingx.com/openApi/spot/v1/market/kline", {"symbol":bsym,"interval":imap.get(interval,"15m"),"limit":limit})
+    data = js.get("data", js if isinstance(js, list) else [])
+    rows=[]
+    for x in data:
+        if isinstance(x, dict):
+            ts=x.get("time") or x.get("openTime") or x.get("T") or x.get("t")
+            rows.append([int(ts), x.get("open") or x.get("o"), x.get("high") or x.get("h"), x.get("low") or x.get("l"), x.get("close") or x.get("c"), x.get("volume") or x.get("v") or x.get("vol") or 0])
+        else:
+            rows.append([int(x[0]), x[1], x[2], x[3], x[4], x[5] if len(x)>5 else 0])
+    rows=sorted(rows, key=lambda r:r[0])
+    return df_from_rows(rows, f"REAL: BINGX_SPOT {bsym}")
+
+def fetch_mexc(symbol, interval, limit):
+    imap={"15m":"15m","1h":"60m","4h":"4h","1d":"1d"}
+    js = request_json("https://api.mexc.com/api/v3/klines", {"symbol":symbol,"interval":imap.get(interval,"15m"),"limit":limit})
+    rows = [[int(x[0]),x[1],x[2],x[3],x[4],x[5] if len(x)>5 else 0] for x in js]
+    return df_from_rows(rows, f"REAL: MEXC_SPOT {symbol}")
 
 def fetch_coinbase(symbol, interval, limit):
-    smap={"BTCUSDT":"BTC-USD","ETHUSDT":"ETH-USD","SOLUSDT":"SOL-USD","XRPUSDT":"XRP-USD"}
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol.replace("USD", "")
+    products=[f"{base}-USD", f"{base}-USDC", f"{base}-USDT"]
     gran={"15m":900,"1h":3600,"4h":14400,"1d":86400}.get(interval,900)
     end=int(time.time()); start=end-gran*min(limit,300)
-    js = request_json(f"https://api.exchange.coinbase.com/products/{smap[symbol]}/candles", {"granularity":gran,"start":datetime.utcfromtimestamp(start).isoformat(),"end":datetime.utcfromtimestamp(end).isoformat()})
-    rows = [[int(x[0])*1000,x[3],x[2],x[1],x[4],x[5]] for x in js][::-1]
-    return df_from_rows(rows, "REAL: COINBASE")
+    last_err=None
+    for prod in products:
+        try:
+            js = request_json(f"https://api.exchange.coinbase.com/products/{prod}/candles", {"granularity":gran,"start":datetime.utcfromtimestamp(start).isoformat(),"end":datetime.utcfromtimestamp(end).isoformat()})
+            rows = [[int(x[0])*1000,x[3],x[2],x[1],x[4],x[5]] for x in js][::-1]
+            return df_from_rows(rows, f"REAL: COINBASE {prod}")
+        except Exception as e:
+            last_err=e
+    raise RuntimeError(last_err or "coinbase failed")
 
 def fetch_coingecko(symbol, interval, limit):
     # CoinGecko often works from Railway. It returns real USD market data, converted to candles from price points.
-    cid = COINGECKO_IDS[symbol]
+    cid = COINGECKO_IDS.get(symbol)
+    if not cid:
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        search = request_json("https://api.coingecko.com/api/v3/search", {"query":base})
+        coins = search.get("coins", [])
+        match = next((c for c in coins if c.get("symbol", "").upper() == base), coins[0] if coins else None)
+        if not match: raise RuntimeError("coingecko coin not found")
+        cid = match.get("id")
     days = 7 if interval in ("15m","1h") else 90
     js = request_json(f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart", {"vs_currency":"usd","days":days})
     prices = js.get("prices", [])
@@ -162,7 +237,7 @@ def synthetic(symbol, interval, limit):
     if not ALLOW_SYN: raise RuntimeError("synthetic disabled")
     seed = abs(hash(symbol+interval)) % (2**32)
     rng = np.random.default_rng(seed)
-    base = {"BTCUSDT":65000,"ETHUSDT":3500,"SOLUSDT":150,"XRPUSDT":0.6}.get(symbol,100)
+    base = {"BTCUSDT":65000,"ETHUSDT":3500,"SOLUSDT":150,"XRPUSDT":0.6,"TONUSDT":6,"POLUSDT":0.7,"NOTUSDT":0.008,"DOGSUSDT":0.0003}.get(symbol,100)
     rets = rng.normal(0, 0.0025, limit).cumsum()
     close = base*(1+rets)
     high = close*(1+rng.uniform(0.0005,0.004,limit)); low=close*(1-rng.uniform(0.0005,0.004,limit))
@@ -188,7 +263,7 @@ def fetch_candles(symbol, interval="15m", limit=500):
     if cached and now-cached[0] < CACHE_TTL:
         df, src = cached[1].copy(), cached[2] + " / MEMORY_CACHE"
         return df, src
-    providers = [fetch_proxy, fetch_binance, fetch_bybit, fetch_okx, fetch_coinbase, fetch_coingecko]
+    providers = [fetch_proxy, fetch_binance, fetch_bybit, fetch_okx, fetch_bingx, fetch_mexc, fetch_coinbase, fetch_coingecko]
     errors=[]
     for fn in providers:
         try:
@@ -370,7 +445,7 @@ def make_chart(res, symbol):
     buf=io.BytesIO(); fig.tight_layout(); fig.savefig(buf, format='png'); plt.close(fig); buf.seek(0); return buf
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"{VERSION}\nОдна кнопка монеты = полный анализ: LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, Monte Carlo, HTF alignment, Session AI, Liquidity Map v2, Dynamic RR, journal/cache.", reply_markup=KEYBOARD)
+    await update.message.reply_text(f"{VERSION}\nОдна кнопка или любой тикер текстом = полный анализ. Примеры: ton, pol, not, dogs, /analyze pepe. LONG/SHORT %, confidence, Elliott, CVD, VPVR, heatmap, regime AI, HTF alignment, Session AI, Liquidity Map v2, Dynamic RR, journal/cache.", reply_markup=KEYBOARD)
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s=int(time.time()-START_TS); await update.message.reply_text(f"Работает: {s//3600}h {(s%3600)//60}m {s%60}s\n{VERSION}")
@@ -379,7 +454,8 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     st=get_stats(); await update.message.reply_text(f"Signals: {st['total']}\nLONG: {st['longs']} | SHORT: {st['shorts']}\nAvg confidence: {st['avg_confidence']}%")
 
 async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, coin: str):
-    symbol=SYMBOLS[coin]
+    coin = coin.upper()
+    symbol=symbol_from_coin(coin)
     await update.message.reply_text(f"Считаю {VERSION} {symbol}: multi-TF, Elliott, SMC, CVD, VPVR, heatmap, orderflow, regime AI, Monte Carlo, walk-forward...")
     try:
         tfdata = fetch_multi_tf(symbol)
@@ -412,14 +488,27 @@ async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE, coin: str)
         if len(msg)>1024: await update.message.reply_text(msg[1024:])
     except Exception as e:
         print("ANALYSIS_FATAL", traceback.format_exc(), flush=True)
-        await update.message.reply_text("Ошибка анализа. Открой Railway Logs и пришли последние 30 строк. В v10 бот должен уходить в DEMO fallback, если все market API недоступны.")
+        await update.message.reply_text("Ошибка анализа. Открой Railway Logs и пришли последние 30 строк. В v12 бот должен уходить в DEMO fallback, если все market API недоступны.")
+
+async def analyze_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Напиши так: /analyze ton или просто отправь тикер: ton")
+        return
+    coin, err = normalize_coin(" ".join(context.args))
+    if not coin:
+        await update.message.reply_text("Не понял тикер. Пример: /analyze ton, /analyze pol, /analyze dogs")
+        return
+    await analyze(update, context, coin)
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t=(update.message.text or '').strip().upper()
-    if t in SYMBOLS: await analyze(update, context, t)
-    elif t=="STATS": await stats_cmd(update, context)
-    elif t=="STATUS": await ping(update, context)
-    else: await update.message.reply_text("Выбери монету кнопкой: BTC / ETH / SOL / XRP", reply_markup=KEYBOARD)
+    t=(update.message.text or '').strip()
+    up=t.upper()
+    if up=="STATS": await stats_cmd(update, context); return
+    if up=="STATUS": await ping(update, context); return
+    coin, err = normalize_coin(t)
+    if coin:
+        await analyze(update, context, coin); return
+    await update.message.reply_text("Напиши тикер монеты, например: BTC, TON, POL, NOT, DOGS, PEPE. Или командой: /analyze ton", reply_markup=KEYBOARD)
 
 def main():
     if not TOKEN: raise SystemExit("Set TELEGRAM_BOT_TOKEN in Railway Variables")
@@ -427,7 +516,7 @@ def main():
     threading.Thread(target=run_web, daemon=True).start()
     print(VERSION, "STARTED", "ALLOW_SYN", ALLOW_SYN, flush=True)
     app_tg=Application.builder().token(TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start)); app_tg.add_handler(CommandHandler("ping", ping)); app_tg.add_handler(CommandHandler("status", ping)); app_tg.add_handler(CommandHandler("stats", stats_cmd))
+    app_tg.add_handler(CommandHandler("start", start)); app_tg.add_handler(CommandHandler("ping", ping)); app_tg.add_handler(CommandHandler("status", ping)); app_tg.add_handler(CommandHandler("stats", stats_cmd)); app_tg.add_handler(CommandHandler("analyze", analyze_cmd))
     for c in SYMBOLS:
         app_tg.add_handler(CommandHandler(c.lower(), lambda u,ctx,coin=c: analyze(u,ctx,coin)))
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
